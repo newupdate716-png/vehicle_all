@@ -1,399 +1,456 @@
-from flask import Flask, request, jsonify
-import os
-import re
-import time
-import json
 import requests
 from bs4 import BeautifulSoup
+import re
+from flask import Flask, request, jsonify
+from threading import Thread
+from colorama import Fore, Style, init
+import time
 
+# Initialize colorama for colored output
+init(autoreset=True)
+
+# ===============================================
+# FLASK APP SETUP
+# ===============================================
 app = Flask(__name__)
 
-# Config
-TARGET_BASE = os.getenv("TARGET_BASE", "https://pakistandatabase.com")
-TARGET_PATH = os.getenv("TARGET_PATH", "/databases/sim.php")
-POLICE_PATH = os.getenv("POLICE_PATH", "/databases/police.php")
-LANDLINE_PATH = os.getenv("LANDLINE_PATH", "/databases/landline.php")
-MIN_INTERVAL = float(os.getenv("MIN_INTERVAL", "1.0"))
-LAST_CALL = {"ts": 0.0}
+# ===============================================
+# CONFIGURATION
+# ===============================================
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36",
+    "Referer": "https://vahanx.in/",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br"
+}
 
-COPYRIGHT_HANDLE = "@sakib01994"
-COPYRIGHT_NOTICE = "👉🏻 " + COPYRIGHT_HANDLE
+FLASK_PORT = 8888
 
-def is_mobile(value: str) -> bool:
-    return bool(re.fullmatch(r"92\d{9,12}", (value or "").strip()))
-
-def is_cnic(value: str) -> bool:
-    return bool(re.fullmatch(r"\d{13}", (value or "").strip()))
-
-def validate_mobile(value: str):
-    value = value.strip()
-    if not value:
-        raise ValueError("Mobile number cannot be empty")
-    if not value.startswith('92'):
-        raise ValueError("Mobile number must start with 92")
-    if not value[2:].isdigit():
-        raise ValueError("Mobile number must contain only digits after 92")
-    if len(value) < 11 or len(value) > 13:
-        raise ValueError("Mobile number must be 11-13 digits total (including 92)")
-    return value
-
-def validate_cnic(value: str):
-    value = value.strip()
-    if not value:
-        raise ValueError("CNIC cannot be empty")
-    if not value.isdigit():
-        raise ValueError("CNIC must contain only digits")
-    if len(value) != 13:
-        raise ValueError("CNIC must be exactly 13 digits")
-    return value
-
-def validate_police_query(value: str):
-    value = value.strip()
-    if not value:
-        raise ValueError("Query cannot be empty")
+# ===============================================
+# ENHANCED VEHICLE INFO SCRAPER
+# ===============================================
+def get_comprehensive_vehicle_details(rc_number: str) -> dict:
+    """Enhanced scraper combining both approaches for maximum detail extraction."""
+    rc = rc_number.strip().upper()
+    url = f"https://vahanx.in/rc-search/{rc}"
     
-    # Check if it's a mobile number (with 92 or 0)
-    if value.startswith('92') and value[2:].isdigit() and len(value) >= 11:
-        return "mobile", value
-    elif value.startswith('0') and value[1:].isdigit() and len(value) >= 10:
-        return "mobile", value
-    # Check if it's CNIC
-    elif value.isdigit() and len(value) == 13:
-        return "cnic", value
-    else:
-        raise ValueError("Invalid format. Use mobile (92XXXXXXXXXX or 0XXXXXXXXX) or CNIC (13 digits)")
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+    except Exception as e:
+        return {"error": f"Failed to fetch data: {str(e)}"}
 
-def validate_landline(value: str):
-    value = value.strip()
-    if not value:
-        raise ValueError("Landline number cannot be empty")
-    if not value.isdigit():
-        raise ValueError("Landline number must contain only digits")
-    if len(value) < 9 or len(value) > 12:
-        raise ValueError("Landline number must be 9-12 digits")
-    return value
+    # Helper function to extract card values
+    def extract_card(label):
+        for div in soup.select(".hrcd-cardbody"):
+            span = div.find("span")
+            if span and label.lower() in span.text.lower():
+                p = div.find("p")
+                return p.get_text(strip=True) if p else None
+        return None
 
-def rate_limit_wait():
-    now = time.time()
-    elapsed = now - LAST_CALL["ts"]
-    if elapsed < MIN_INTERVAL:
-        time.sleep(MIN_INTERVAL - elapsed)
-    LAST_CALL["ts"] = time.time()
+    # Helper function to extract from sections
+    def extract_from_section(header_text, keys):
+        section = soup.find("h3", string=lambda s: s and header_text.lower() in s.lower())
+        section_card = section.find_parent("div", class_="hrc-details-card") if section else None
+        result = {}
+        for key in keys:
+            span = section_card.find("span", string=lambda s: s and key in s) if section_card else None
+            if span:
+                val = span.find_next("p")
+                result[key.lower().replace(" ", "_")] = val.get_text(strip=True) if val else None
+        return result
 
-def fetch_upstream(query_value: str):
-    rate_limit_wait()
-    session = requests.Session()
-    headers = {
-        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"),
-        "Referer": TARGET_BASE.rstrip("/") + "/",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Content-Type": "application/x-www-form-urlencoded",
+    # Generic value extractor
+    def get_value(label):
+        try:
+            div = soup.find("span", string=label)
+            if div:
+                div = div.find_parent("div")
+                p = div.find("p") if div else None
+                return p.get_text(strip=True) if p else None
+        except:
+            return None
+
+    # Extract registration number from h1
+    try:
+        registration_number = soup.find("h1").text.strip()
+    except:
+        registration_number = rc
+
+    # Extract main card details
+    modal_name = extract_card("Modal Name") or get_value("Model Name")
+    owner_name = extract_card("Owner Name") or get_value("Owner Name")
+    code = extract_card("Code")
+    city = extract_card("City Name") or get_value("City Name")
+    phone = extract_card("Phone") or get_value("Phone")
+    website = extract_card("Website")
+    address = extract_card("Address") or get_value("Address")
+
+    # Extract ownership details
+    ownership = extract_from_section("Ownership Details", [
+        "Owner Name", "Father's Name", "Owner Serial No", "Registration Number", "Registered RTO"
+    ])
+
+    # Extract vehicle details
+    vehicle = extract_from_section("Vehicle Details", [
+        "Model Name", "Maker Model", "Vehicle Class", "Fuel Type", "Fuel Norms", 
+        "Cubic Capacity", "Seating Capacity"
+    ])
+
+    # Extract insurance information
+    insurance_expired_box = soup.select_one(".insurance-alert-box.expired .title")
+    expired_days = None
+    if insurance_expired_box:
+        match = re.search(r"(\d+)", insurance_expired_box.text)
+        expired_days = int(match.group(1)) if match else None
+    
+    insurance = extract_from_section("Insurance Information", [
+        "Insurance Company", "Insurance No", "Insurance Expiry", "Insurance Upto"
+    ])
+    
+    insurance_status = "Expired" if expired_days else "Active"
+    
+    # Extract important dates
+    validity = extract_from_section("Important Dates", [
+        "Registration Date", "Vehicle Age", "Fitness Upto", "Insurance Upto", 
+        "Insurance Expiry In", "Tax Upto", "Tax Paid Upto"
+    ])
+
+    # Extract PUC details
+    puc = extract_from_section("PUC Details", [
+        "PUC No", "PUC Upto"
+    ])
+
+    # Extract other information
+    other = extract_from_section("Other Information", [
+        "Financer Name", "Financier Name", "Cubic Capacity", "Seating Capacity", 
+        "Permit Type", "Blacklist Status", "NOC Details"
+    ])
+
+    # Compile comprehensive data
+    data = {
+        "registration_number": registration_number,
+        "status": "success",
+        "basic_info": {
+            "model_name": modal_name,
+            "owner_name": owner_name,
+            "fathers_name": get_value("Father's Name") or ownership.get("father's_name"),
+            "code": code,
+            "city": city,
+            "phone": phone,
+            "website": website,
+            "address": address
+        },
+        "ownership_details": {
+            "owner_name": ownership.get("owner_name") or owner_name,
+            "fathers_name": ownership.get("father's_name"),
+            "serial_no": ownership.get("owner_serial_no") or get_value("Owner Serial No"),
+            "rto": ownership.get("registered_rto") or get_value("Registered RTO")
+        },
+        "vehicle_details": {
+            "maker": vehicle.get("model_name") or modal_name,
+            "model": vehicle.get("maker_model") or get_value("Maker Model"),
+            "vehicle_class": vehicle.get("vehicle_class") or get_value("Vehicle Class"),
+            "fuel_type": vehicle.get("fuel_type") or get_value("Fuel Type"),
+            "fuel_norms": vehicle.get("fuel_norms") or get_value("Fuel Norms"),
+            "cubic_capacity": vehicle.get("cubic_capacity") or other.get("cubic_capacity"),
+            "seating_capacity": vehicle.get("seating_capacity") or other.get("seating_capacity")
+        },
+        "insurance": {
+            "status": insurance_status,
+            "company": insurance.get("insurance_company") or get_value("Insurance Company"),
+            "policy_number": insurance.get("insurance_no") or get_value("Insurance No"),
+            "expiry_date": insurance.get("insurance_expiry") or get_value("Insurance Expiry"),
+            "valid_upto": insurance.get("insurance_upto") or get_value("Insurance Upto"),
+            "expired_days_ago": expired_days
+        },
+        "validity": {
+            "registration_date": validity.get("registration_date") or get_value("Registration Date"),
+            "vehicle_age": validity.get("vehicle_age") or get_value("Vehicle Age"),
+            "fitness_upto": validity.get("fitness_upto") or get_value("Fitness Upto"),
+            "insurance_upto": validity.get("insurance_upto") or get_value("Insurance Upto"),
+            "insurance_status": validity.get("insurance_expiry_in"),
+            "tax_upto": validity.get("tax_upto") or validity.get("tax_paid_upto") or get_value("Tax Upto")
+        },
+        "puc_details": {
+            "puc_number": puc.get("puc_no") or get_value("PUC No"),
+            "puc_valid_upto": puc.get("puc_upto") or get_value("PUC Upto")
+        },
+        "other_info": {
+            "financer": other.get("financer_name") or other.get("financier_name") or get_value("Financier Name"),
+            "permit_type": other.get("permit_type") or get_value("Permit Type"),
+            "blacklist_status": other.get("blacklist_status") or get_value("Blacklist Status"),
+            "noc": other.get("noc_details") or get_value("NOC Details")
+        }
     }
-    url = TARGET_BASE.rstrip("/") + TARGET_PATH
-    data = {"search_query": query_value}
-    resp = session.post(url, headers=headers, data=data, timeout=200)
-    resp.raise_for_status()
-    return resp.text
 
-def fetch_police_upstream(query_value: str):
-    rate_limit_wait()
-    session = requests.Session()
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Mobile Safari/537.36",
-        "Referer": TARGET_BASE.rstrip("/") + "/databases/police.php",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Origin": TARGET_BASE.rstrip("/"),
-        "Upgrade-Insecure-Requests": "1",
-    }
-    url = TARGET_BASE.rstrip("/") + POLICE_PATH
-    data = {"search_query": query_value}
-    resp = session.post(url, headers=headers, data=data, timeout=200)
-    resp.raise_for_status()
-    return resp.text
+    # Remove None values
+    def clean_dict(d):
+        if isinstance(d, dict):
+            return {k: clean_dict(v) for k, v in d.items() if v is not None and v != ""}
+        return d
+    
+    return clean_dict(data)
 
-def fetch_landline_upstream(query_value: str):
-    rate_limit_wait()
-    session = requests.Session()
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Mobile Safari/537.36",
-        "Referer": TARGET_BASE.rstrip("/") + "/databases/landline.php",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Origin": TARGET_BASE.rstrip("/"),
-        "Upgrade-Insecure-Requests": "1",
-    }
-    url = TARGET_BASE.rstrip("/") + LANDLINE_PATH
-    data = {"search_query": query_value}
-    resp = session.post(url, headers=headers, data=data, timeout=20)
-    resp.raise_for_status()
-    return resp.text
-
-def parse_table(html: str):
-    soup = BeautifulSoup(html, "html.parser")
-    table = soup.find("table", {"class": "api-response"}) or soup.find("table")
-    if not table:
-        return []
-    tbody = table.find("tbody")
-    if not tbody:
-        return []
-    results = []
-    for tr in tbody.find_all("tr"):
-        cols = [td.get_text(strip=True) for td in tr.find_all("td")]
-        if len(cols) >= 4:
-            results.append({
-                "mobile": cols[0],
-                "name": cols[1],
-                "cnic": cols[2],
-                "address": cols[3],
-            })
-    return results
-
-def parse_police_table(html: str):
-    soup = BeautifulSoup(html, "html.parser")
-    table = soup.find("table", {"class": "api-response"}) or soup.find("table")
-    if not table:
-        return []
-    
-    results = []
-    
-    # Try to find table rows
-    rows = table.find_all("tr")
-    if not rows:
-        return []
-    
-    # Skip header row and process data rows
-    for tr in rows[1:]:
-        cols = [td.get_text(strip=True) for td in tr.find_all("td")]
-        if len(cols) >= 4:
-            results.append({
-                "cnic": cols[0] if len(cols) > 0 else "",
-                "name": cols[1] if len(cols) > 1 else "",
-                "father_name": cols[2] if len(cols) > 2 else "",
-                "address": cols[3] if len(cols) > 3 else "",
-                "crime_details": cols[4] if len(cols) > 4 else "",
-                "police_station": cols[5] if len(cols) > 5 else "",
-                "status": cols[6] if len(cols) > 6 else "",
-            })
-        elif len(cols) == 1:
-            # Sometimes results might be in different format
-            results.append({
-                "info": cols[0],
-                "cnic": "",
-                "name": "",
-                "father_name": "",
-                "address": "",
-                "crime_details": "",
-                "police_station": "",
-                "status": "",
-            })
-    
-    return results
-
-def parse_landline_table(html: str):
-    soup = BeautifulSoup(html, "html.parser")
-    table = soup.find("table", {"class": "api-response"}) or soup.find("table")
-    if not table:
-        return []
-    
-    results = []
-    
-    # Try to find table rows
-    rows = table.find_all("tr")
-    if not rows:
-        return []
-    
-    # Skip header row and process data rows
-    for tr in rows[1:]:
-        cols = [td.get_text(strip=True) for td in tr.find_all("td")]
-        if len(cols) >= 3:
-            results.append({
-                "number": cols[0] if len(cols) > 0 else "",
-                "name": cols[1] if len(cols) > 1 else "",
-                "address": cols[2] if len(cols) > 2 else "",
-                "area": cols[3] if len(cols) > 3 else "",
-                "type": cols[4] if len(cols) > 4 else "",
-            })
-    
-    return results
-
-@app.route('/')
+# ===============================================
+# FLASK API ROUTES
+# ===============================================
+@app.route("/", methods=["GET"])
 def home():
     return jsonify({
-        "message": "Pakistan Database API - Live Mode",
-        "version": "1.0",
+        "status": "online",
+        "service": "Vehicle Information API",
+        "version": "2.0",
         "endpoints": {
-            "/api/mobile": "Mobile number lookup (GET/POST)",
-            "/api/cnic": "CNIC lookup (GET/POST)", 
-            "/api/police": "Crime history lookup (GET/POST)",
-            "/api/landline": "Landline lookup (GET/POST)",
-            "/health": "Health check"
+            "vehicle_info": "/api/vehicle-info?rc=<RC_NUMBER>",
+            "health": "/health"
         },
-        "copyright": COPYRIGHT_NOTICE,
-        "telegram": "@Bj_devs"
+        "example": f"http://localhost:{FLASK_PORT}/api/vehicle-info?rc=DL01AB1234"
     })
 
-@app.route('/health')
+@app.route("/health", methods=["GET"])
 def health():
     return jsonify({
         "status": "healthy",
-        "service": "Pakistan Database API",
-        "copyright": COPYRIGHT_NOTICE
+        "api": "active",
+        "timestamp": time.time()
     })
 
-@app.route('/api/mobile', methods=['GET', 'POST'])
-def mobile_lookup():
-    try:
-        if request.method == 'POST':
-            data = request.get_json()
-            if not data or 'query' not in data:
-                return jsonify({"error": "Missing 'query' in JSON body"}), 400
-            query = data['query']
-        else:
-            query = request.args.get('query')
-        
-        if not query:
-            return jsonify({"error": "Missing query parameter"}), 400
-        
-        normalized = validate_mobile(query)
-        
-        html = fetch_upstream(normalized)
-        results = parse_table(html)
-        
-        response = {
-            "success": True,
-            "query": normalized,
-            "query_type": "mobile",
-            "results_count": len(results),
-            "results": results,
-            "copyright": COPYRIGHT_NOTICE,
-            "credit": "@Bj_devs & ABBAS"
-        }
-        
-        return jsonify(response)
-        
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-    except requests.RequestException as e:
-        return jsonify({"error": f"Network error: {str(e)}"}), 500
-    except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+@app.route("/api/vehicle-info", methods=["GET"])
+def get_vehicle_info():
+    rc = request.args.get("rc")
+    if not rc:
+        return jsonify({"error": "Missing rc parameter", "usage": "/api/vehicle-info?rc=<RC_NUMBER>"}), 400
 
-@app.route('/api/cnic', methods=['GET', 'POST'])
-def cnic_lookup():
     try:
-        if request.method == 'POST':
-            data = request.get_json()
-            if not data or 'query' not in data:
-                return jsonify({"error": "Missing 'query' in JSON body"}), 400
-            query = data['query']
-        else:
-            query = request.args.get('query')
-        
-        if not query:
-            return jsonify({"error": "Missing query parameter"}), 400
-        
-        normalized = validate_cnic(query)
-        
-        html = fetch_upstream(normalized)
-        results = parse_table(html)
-        
-        response = {
-            "success": True,
-            "query": normalized,
-            "query_type": "cnic",
-            "results_count": len(results),
-            "results": results,
-            "copyright": COPYRIGHT_NOTICE,
-            "credit": "@Bj_devs & ABBAS"
-        }
-        
-        return jsonify(response)
-        
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-    except requests.RequestException as e:
-        return jsonify({"error": f"Network error: {str(e)}"}), 500
+        data = get_comprehensive_vehicle_details(rc)
+        if data.get("error"):
+            return jsonify(data), 404
+        return jsonify(data)
     except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+        return jsonify({"error": str(e)}), 500
 
-@app.route('/api/police', methods=['GET', 'POST'])
-def police_lookup():
+# ===============================================
+# CONSOLE DISPLAY FUNCTIONS
+# ===============================================
+def print_banner():
+    """Display application banner"""
+    banner = f"""
+{Fore.CYAN}╔═══════════════════════════════════════════════════════════╗
+║                                                           ║
+║        🚗 VEHICLE INFORMATION API + CONSOLE 🚗            ║
+║                                                           ║
+║          Comprehensive RC Details Lookup System           ║
+║                                                           ║
+╚═══════════════════════════════════════════════════════════╝{Style.RESET_ALL}
+    """
+    print(banner)
+
+def display_vehicle_details(data):
+    """Display vehicle details in a formatted way"""
+    if data.get("error"):
+        print(f"\n{Fore.RED}❌ ERROR: {data['error']}{Style.RESET_ALL}\n")
+        return
+    
+    print(f"\n{Fore.GREEN}{'='*60}{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}✅ VEHICLE DETAILS FOR: {data['registration_number']}{Style.RESET_ALL}")
+    print(f"{Fore.GREEN}{'='*60}{Style.RESET_ALL}\n")
+    
+    # Basic Information
+    if data.get("basic_info"):
+        print(f"{Fore.YELLOW}📋 BASIC INFORMATION:{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}{'─'*60}{Style.RESET_ALL}")
+        bi = data["basic_info"]
+        if bi.get("owner_name"):
+            print(f"  👤 Owner Name        : {Fore.WHITE}{bi['owner_name']}{Style.RESET_ALL}")
+        if bi.get("fathers_name"):
+            print(f"  👨 Father's Name     : {Fore.WHITE}{bi['fathers_name']}{Style.RESET_ALL}")
+        if bi.get("model_name"):
+            print(f"  🚗 Model Name        : {Fore.WHITE}{bi['model_name']}{Style.RESET_ALL}")
+        if bi.get("city"):
+            print(f"  🏙️  City              : {Fore.WHITE}{bi['city']}{Style.RESET_ALL}")
+        if bi.get("phone"):
+            print(f"  📞 Phone             : {Fore.WHITE}{bi['phone']}{Style.RESET_ALL}")
+        if bi.get("address"):
+            print(f"  📍 Address           : {Fore.WHITE}{bi['address']}{Style.RESET_ALL}")
+        print()
+
+    # Ownership Details
+    if data.get("ownership_details"):
+        print(f"{Fore.YELLOW}👥 OWNERSHIP DETAILS:{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}{'─'*60}{Style.RESET_ALL}")
+        od = data["ownership_details"]
+        if od.get("owner_name"):
+            print(f"  👤 Owner             : {Fore.WHITE}{od['owner_name']}{Style.RESET_ALL}")
+        if od.get("fathers_name"):
+            print(f"  👨 Father's Name     : {Fore.WHITE}{od['fathers_name']}{Style.RESET_ALL}")
+        if od.get("serial_no"):
+            print(f"  🔢 Serial Number     : {Fore.WHITE}{od['serial_no']}{Style.RESET_ALL}")
+        if od.get("rto"):
+            print(f"  🏢 Registered RTO    : {Fore.WHITE}{od['rto']}{Style.RESET_ALL}")
+        print()
+
+    # Vehicle Details
+    if data.get("vehicle_details"):
+        print(f"{Fore.YELLOW}🚙 VEHICLE SPECIFICATIONS:{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}{'─'*60}{Style.RESET_ALL}")
+        vd = data["vehicle_details"]
+        if vd.get("maker"):
+            print(f"  🏭 Maker             : {Fore.WHITE}{vd['maker']}{Style.RESET_ALL}")
+        if vd.get("model"):
+            print(f"  📦 Model             : {Fore.WHITE}{vd['model']}{Style.RESET_ALL}")
+        if vd.get("vehicle_class"):
+            print(f"  🏷️  Vehicle Class     : {Fore.WHITE}{vd['vehicle_class']}{Style.RESET_ALL}")
+        if vd.get("fuel_type"):
+            print(f"  ⛽ Fuel Type         : {Fore.WHITE}{vd['fuel_type']}{Style.RESET_ALL}")
+        if vd.get("fuel_norms"):
+            print(f"  🌱 Fuel Norms        : {Fore.WHITE}{vd['fuel_norms']}{Style.RESET_ALL}")
+        if vd.get("cubic_capacity"):
+            print(f"  🔧 Cubic Capacity    : {Fore.WHITE}{vd['cubic_capacity']}{Style.RESET_ALL}")
+        if vd.get("seating_capacity"):
+            print(f"  💺 Seating Capacity  : {Fore.WHITE}{vd['seating_capacity']}{Style.RESET_ALL}")
+        print()
+
+    # Insurance Details
+    if data.get("insurance"):
+        print(f"{Fore.YELLOW}🛡️  INSURANCE DETAILS:{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}{'─'*60}{Style.RESET_ALL}")
+        ins = data["insurance"]
+        status_color = Fore.RED if ins.get("status") == "Expired" else Fore.GREEN
+        print(f"  📊 Status            : {status_color}{ins.get('status', 'Unknown')}{Style.RESET_ALL}")
+        if ins.get("company"):
+            print(f"  🏢 Company           : {Fore.WHITE}{ins['company']}{Style.RESET_ALL}")
+        if ins.get("policy_number"):
+            print(f"  📄 Policy Number     : {Fore.WHITE}{ins['policy_number']}{Style.RESET_ALL}")
+        if ins.get("expiry_date"):
+            print(f"  📅 Expiry Date       : {Fore.WHITE}{ins['expiry_date']}{Style.RESET_ALL}")
+        if ins.get("valid_upto"):
+            print(f"  ✅ Valid Upto        : {Fore.WHITE}{ins['valid_upto']}{Style.RESET_ALL}")
+        if ins.get("expired_days_ago"):
+            print(f"  ⚠️  Expired           : {Fore.RED}{ins['expired_days_ago']} days ago{Style.RESET_ALL}")
+        print()
+
+    # Validity Information
+    if data.get("validity"):
+        print(f"{Fore.YELLOW}📅 VALIDITY INFORMATION:{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}{'─'*60}{Style.RESET_ALL}")
+        val = data["validity"]
+        if val.get("registration_date"):
+            print(f"  📆 Registration Date : {Fore.WHITE}{val['registration_date']}{Style.RESET_ALL}")
+        if val.get("vehicle_age"):
+            print(f"  ⏳ Vehicle Age       : {Fore.WHITE}{val['vehicle_age']}{Style.RESET_ALL}")
+        if val.get("fitness_upto"):
+            print(f"  ✅ Fitness Upto      : {Fore.WHITE}{val['fitness_upto']}{Style.RESET_ALL}")
+        if val.get("insurance_upto"):
+            print(f"  🛡️  Insurance Upto    : {Fore.WHITE}{val['insurance_upto']}{Style.RESET_ALL}")
+        if val.get("tax_upto"):
+            print(f"  💵 Tax Upto          : {Fore.WHITE}{val['tax_upto']}{Style.RESET_ALL}")
+        print()
+
+    # PUC Details
+    if data.get("puc_details") and any(data["puc_details"].values()):
+        print(f"{Fore.YELLOW}🔍 PUC DETAILS:{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}{'─'*60}{Style.RESET_ALL}")
+        puc = data["puc_details"]
+        if puc.get("puc_number"):
+            print(f"  📋 PUC Number        : {Fore.WHITE}{puc['puc_number']}{Style.RESET_ALL}")
+        if puc.get("puc_valid_upto"):
+            print(f"  📅 Valid Upto        : {Fore.WHITE}{puc['puc_valid_upto']}{Style.RESET_ALL}")
+        print()
+
+    # Other Information
+    if data.get("other_info") and any(data["other_info"].values()):
+        print(f"{Fore.YELLOW}ℹ️  OTHER INFORMATION:{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}{'─'*60}{Style.RESET_ALL}")
+        oi = data["other_info"]
+        if oi.get("financer"):
+            print(f"  🏦 Financer          : {Fore.WHITE}{oi['financer']}{Style.RESET_ALL}")
+        if oi.get("permit_type"):
+            print(f"  📜 Permit Type       : {Fore.WHITE}{oi['permit_type']}{Style.RESET_ALL}")
+        if oi.get("blacklist_status"):
+            status_color = Fore.RED if "yes" in str(oi['blacklist_status']).lower() else Fore.GREEN
+            print(f"  ⚠️  Blacklist Status  : {status_color}{oi['blacklist_status']}{Style.RESET_ALL}")
+        if oi.get("noc"):
+            print(f"  📄 NOC Details       : {Fore.WHITE}{oi['noc']}{Style.RESET_ALL}")
+        print()
+
+    print(f"{Fore.GREEN}{'='*60}{Style.RESET_ALL}\n")
+
+# ===============================================
+# FLASK RUNNER IN THREAD
+# ===============================================
+def run_flask():
+    """Run Flask API in background"""
+    app.run(host="0.0.0.0", port=FLASK_PORT, debug=False, use_reloader=False)
+
+# ===============================================
+# CONSOLE INTERFACE
+# ===============================================
+def console_mode():
+    """Console interface for vehicle lookup"""
+    print_banner()
+    
+    print(f"{Fore.GREEN}✅ Flask API is running on: {Fore.CYAN}http://localhost:{FLASK_PORT}{Style.RESET_ALL}")
+    print(f"{Fore.GREEN}📡 API Endpoint: {Fore.CYAN}http://localhost:{FLASK_PORT}/api/vehicle-info?rc=<RC_NUMBER>{Style.RESET_ALL}\n")
+    print(f"{Fore.YELLOW}{'─'*60}{Style.RESET_ALL}\n")
+    
+    while True:
+        try:
+            print(f"{Fore.CYAN}Enter vehicle registration number (or 'quit' to exit):{Style.RESET_ALL}")
+            rc_number = input(f"{Fore.YELLOW}RC Number > {Style.RESET_ALL}").strip()
+            
+            if rc_number.lower() in ['quit', 'exit', 'q']:
+                print(f"\n{Fore.CYAN}👋 Thank you for using Vehicle Information System!{Style.RESET_ALL}\n")
+                break
+            
+            if not rc_number:
+                print(f"{Fore.RED}❌ Please enter a valid RC number!{Style.RESET_ALL}\n")
+                continue
+            
+            # Fetch and display vehicle details
+            print(f"\n{Fore.YELLOW}🔍 Fetching data from vahanx.in...{Style.RESET_ALL}")
+            details = get_comprehensive_vehicle_details(rc_number)
+            print(f"{Fore.GREEN}✅ Data fetched successfully!{Style.RESET_ALL}")
+            display_vehicle_details(details)
+            
+            # Ask if user wants to continue
+            print(f"{Fore.CYAN}Do you want to search another vehicle? (yes/no):{Style.RESET_ALL}")
+            choice = input(f"{Fore.YELLOW}Choice > {Style.RESET_ALL}").strip().lower()
+            
+            if choice not in ['yes', 'y', '']:
+                print(f"\n{Fore.CYAN}👋 Thank you for using Vehicle Information System!{Style.RESET_ALL}\n")
+                break
+            
+            print("\n" + "="*60 + "\n")
+            
+        except KeyboardInterrupt:
+            print(f"\n\n{Fore.YELLOW}⚠️  Interrupted by user{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}👋 Thank you for using Vehicle Information System!{Style.RESET_ALL}\n")
+            break
+        except Exception as e:
+            print(f"\n{Fore.RED}❌ Unexpected error: {str(e)}{Style.RESET_ALL}\n")
+            continue
+
+# ===============================================
+# MAIN FUNCTION
+# ===============================================
+def main():
+    """Main application entry point"""
     try:
-        if request.method == 'POST':
-            data = request.get_json()
-            if not data or 'query' not in data:
-                return jsonify({"error": "Missing 'query' in JSON body"}), 400
-            query = data['query']
-        else:
-            query = request.args.get('query')
+        # Start Flask API in background thread
+        flask_thread = Thread(target=run_flask, daemon=True)
+        flask_thread.start()
         
-        if not query:
-            return jsonify({"error": "Missing query parameter"}), 400
+        # Give Flask a moment to start
+        time.sleep(2)
         
-        qtype, normalized = validate_police_query(query)
+        # Start console interface
+        console_mode()
         
-        html = fetch_police_upstream(normalized)
-        results = parse_police_table(html)
-        
-        response = {
-            "success": True,
-            "query": normalized,
-            "query_type": qtype,
-            "results_count": len(results),
-            "results": results,
-            "copyright": COPYRIGHT_NOTICE,
-            "credit": "@Bj_devs & ABBAS"
-        }
-        
-        return jsonify(response)
-        
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-    except requests.RequestException as e:
-        return jsonify({"error": f"Network error: {str(e)}"}), 500
     except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+        print(f"{Fore.RED}❌ Fatal error: {str(e)}{Style.RESET_ALL}")
 
-@app.route('/api/landline', methods=['GET', 'POST'])
-def landline_lookup():
-    try:
-        if request.method == 'POST':
-            data = request.get_json()
-            if not data or 'query' not in data:
-                return jsonify({"error": "Missing 'query' in JSON body"}), 400
-            query = data['query']
-        else:
-            query = request.args.get('query')
-        
-        if not query:
-            return jsonify({"error": "Missing query parameter"}), 400
-        
-        normalized = validate_landline(query)
-        
-        html = fetch_landline_upstream(normalized)
-        results = parse_landline_table(html)
-        
-        response = {
-            "success": True,
-            "query": normalized,
-            "query_type": "landline",
-            "results_count": len(results),
-            "results": results,
-            "copyright": COPYRIGHT_NOTICE,
-            "credit": "@Bj_devs & ABBAS"
-        }
-        
-        return jsonify(response)
-        
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-    except requests.RequestException as e:
-        return jsonify({"error": f"Network error: {str(e)}"}), 500
-    except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
-
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+if __name__ == "__main__":
+    main()
